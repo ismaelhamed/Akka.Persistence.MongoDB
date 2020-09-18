@@ -6,7 +6,6 @@
 //-----------------------------------------------------------------------
 
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
@@ -15,11 +14,9 @@ using System.Threading.Tasks;
 using Akka.Actor;
 using Akka.Persistence.Journal;
 using Akka.Persistence.MongoDb.Query;
-using Akka.Streams;
 using Akka.Streams.Dsl;
-using MongoDB.Bson;
-using Akka.Serialization;
 using Akka.Util;
+using MongoDB.Bson;
 using MongoDB.Driver;
 
 namespace Akka.Persistence.MongoDb.Journal
@@ -37,19 +34,15 @@ namespace Akka.Persistence.MongoDb.Journal
 
         private readonly HashSet<string> _allPersistenceIds = new HashSet<string>();
         private readonly HashSet<IActorRef> _allPersistenceIdSubscribers = new HashSet<IActorRef>();
-        private readonly Dictionary<string, ISet<IActorRef>> _tagSubscribers =
-            new Dictionary<string, ISet<IActorRef>>();
-        private readonly Dictionary<string, ISet<IActorRef>> _persistenceIdSubscribers
-            = new Dictionary<string, ISet<IActorRef>>();
+        private readonly Dictionary<string, ISet<IActorRef>> _tagSubscribers = new Dictionary<string, ISet<IActorRef>>();
+        private readonly Dictionary<string, ISet<IActorRef>> _persistenceIdSubscribers = new Dictionary<string, ISet<IActorRef>>();
 
         private readonly Akka.Serialization.Serialization _serialization;
 
         public MongoDbJournal()
         {
             _settings = MongoDbPersistence.Get(Context.System).JournalSettings;
-
             _serialization = Context.System.Serialization;
-
         }
 
         protected override void PreStart()
@@ -70,22 +63,25 @@ namespace Akka.Persistence.MongoDb.Journal
 
                 if (_settings.AutoInitialize)
                 {
-                    var modelForEntryAndSequenceNr = new CreateIndexModel<JournalEntry>(Builders<JournalEntry>
-                        .IndexKeys
-                        .Ascending(entry => entry.PersistenceId)
-                        .Descending(entry => entry.SequenceNr));
+                    var modelForEntryAndSequenceNr = new CreateIndexModel<JournalEntry>(
+                        Builders<JournalEntry>.IndexKeys
+                            .Ascending(entry => entry.PersistenceId)
+                            .Ascending(entry => entry.SequenceNr),
+                        new CreateIndexOptions { Unique = true, Sparse = false });
 
-                    collection.Indexes
-                        .CreateOneAsync(modelForEntryAndSequenceNr, cancellationToken: CancellationToken.None)
-                        .Wait();
+                    var modelWithOrdering = new CreateIndexModel<JournalEntry>(Builders<JournalEntry>.IndexKeys
+                        .Ascending(entry => entry.Ordering));
 
-                    var modelWithOrdering = new CreateIndexModel<JournalEntry>(
-                        Builders<JournalEntry>
-                            .IndexKeys
-                            .Ascending(entry => entry.Ordering));
+                    collection.Indexes.CreateOne(modelForEntryAndSequenceNr);
+                    collection.Indexes.CreateOne(modelWithOrdering);
 
-                    collection.Indexes
-                        .CreateOne(modelWithOrdering);
+                    //var modelForEntryAndSequenceNr = new CreateIndexModel<JournalEntry>(
+                    //    Builders<JournalEntry>.IndexKeys.Combine(
+                    //        Builders<JournalEntry>.IndexKeys.Ascending(entry => entry.PersistenceId),
+                    //        Builders<JournalEntry>.IndexKeys.Ascending(entry => entry.SequenceNr)),
+                    //    new CreateIndexOptions { Unique = true, Sparse = false });
+
+                    //collection.Indexes.CreateOneAsync(modelForEntryAndSequenceNr, cancellationToken: CancellationToken.None).Wait();
                 }
 
                 return collection;
@@ -100,11 +96,12 @@ namespace Akka.Persistence.MongoDb.Journal
                     var modelWithAscendingPersistenceId = new CreateIndexModel<MetadataEntry>(
                         Builders<MetadataEntry>
                             .IndexKeys
-                            .Ascending(entry => entry.PersistenceId));
+                            .Ascending(entry => entry.PersistenceId),
+                        new CreateIndexOptions { Unique = true, Sparse = true });
 
                     collection.Indexes
                         .CreateOneAsync(modelWithAscendingPersistenceId, cancellationToken: CancellationToken.None)
-                            .Wait();
+                        .Wait();
                 }
 
                 return collection;
@@ -113,7 +110,7 @@ namespace Akka.Persistence.MongoDb.Journal
 
         public override async Task ReplayMessagesAsync(IActorContext context, string persistenceId, long fromSequenceNr, long toSequenceNr, long max, Action<IPersistentRepresentation> recoveryCallback)
         {
-            NotifyNewPersistenceIdAdded(persistenceId);
+            //NotifyNewPersistenceIdAdded(persistenceId);
 
             // Limit allows only integer
             var limitValue = max >= int.MaxValue ? int.MaxValue : (int)max;
@@ -135,12 +132,222 @@ namespace Akka.Persistence.MongoDb.Journal
                 .Find(filter)
                 .Sort(sort)
                 .Limit(limitValue)
-                .ToListAsync();
+                .ToListAsync().ConfigureAwait(false);
 
-            collections.ForEach(doc =>
+            collections.ForEach(doc => recoveryCallback(ToPersistenceRepresentation(doc, context.Sender)));
+        }
+
+        public override async Task<long> ReadHighestSequenceNrAsync(string persistenceId, long fromSequenceNr)
+        {
+            //NotifyNewPersistenceIdAdded(persistenceId);
+
+            var builder = Builders<MetadataEntry>.Filter;
+            var filter = builder.Eq(x => x.PersistenceId, persistenceId);
+
+            var journalMax = await _journalCollection.Value
+                .Find(Builders<JournalEntry>.Filter.Eq(x => x.PersistenceId, persistenceId))
+                .Sort(Builders<JournalEntry>.Sort.Descending(x => x.SequenceNr))
+                .Project(x => x.SequenceNr)
+                .FirstOrDefaultAsync().ConfigureAwait(false);
+
+            return journalMax > 0
+                ? journalMax
+                : await _metadataCollection.Value
+                    .Find(filter)
+                    .Project(x => x.SequenceNr)
+                    .FirstOrDefaultAsync().ConfigureAwait(false);
+        }
+
+        protected override async Task<IImmutableList<Exception>> WriteMessagesAsync(IEnumerable<AtomicWrite> messages)
+        {
+            var allTags = ImmutableHashSet<string>.Empty;
+            var persistentIds = new HashSet<string>();
+            var messageList = messages.ToList();
+
+            var writeTasks = messageList.Select(async message =>
             {
-                recoveryCallback(ToPersistenceRepresentation(doc, context.Sender));
+                var persistentMessages = (IImmutableList<IPersistentRepresentation>)message.Payload;
+
+                //if (HasTagSubscribers)
+                //{
+                //    foreach (var p in persistentMessages)
+                //    {
+                //        if (p.Payload is Tagged t)
+                //        {
+                //            allTags = allTags.Union(t.Tags);
+                //        }
+                //    }
+                //}
+
+                var journalEntries = persistentMessages.Select(ToJournalEntry);
+
+                await _journalCollection.Value
+                    .WithWriteConcern(WriteConcern.Acknowledged)
+                    .InsertManyAsync(journalEntries).ConfigureAwait(false);
+
+                //if (HasPersistenceIdSubscribers)
+                //    persistentIds.Add(message.PersistenceId);
             });
+
+            //// NOTE: important improvement? since users are likely to do less deletes (or none at all) than writes, 
+            //// it makes sense to move this piece to the delete method.
+            //await SetHighSequenceId(messageList).ConfigureAwait(false);
+
+            return await Task<IImmutableList<Exception>>.Factory
+                .ContinueWhenAll(writeTasks.ToArray(), tasks => tasks.Select(t => t.IsFaulted ? TryUnwrapException(t.Exception) : null)
+                .ToImmutableList()).ConfigureAwait(false);
+
+            //if (HasPersistenceIdSubscribers)
+            //{
+            //    foreach (var id in persistentIds)
+            //    {
+            //        NotifyPersistenceIdChange(id);
+            //    }
+            //}
+
+            //if (HasTagSubscribers && allTags.Count != 0)
+            //{
+            //    foreach (var tag in allTags)
+            //    {
+            //        NotifyTagChange(tag);
+            //    }
+            //}
+
+            //return result;
+        }
+
+        protected override Task DeleteMessagesToAsync(string persistenceId, long toSequenceNr)
+        {
+            //NotifyNewPersistenceIdAdded(persistenceId);
+
+            var builder = Builders<JournalEntry>.Filter;
+            var filter = builder.Eq(x => x.PersistenceId, persistenceId);
+
+            if (toSequenceNr != long.MaxValue)
+                filter &= builder.Lte(x => x.SequenceNr, toSequenceNr);
+
+            return _journalCollection.Value.DeleteManyAsync(filter);
+        }
+
+        private Task SetHighSequenceId(IList<AtomicWrite> messages)
+        {
+            var persistenceId = messages.Select(c => c.PersistenceId).First();
+            var highSequenceId = messages.Max(c => c.HighestSequenceNr);
+
+            var builder = Builders<MetadataEntry>.Filter;
+            var filter = builder.Eq(x => x.PersistenceId, persistenceId);
+
+            var metadataEntry = new MetadataEntry
+            {
+                Id = persistenceId,
+                PersistenceId = persistenceId,
+                SequenceNr = highSequenceId
+            };
+
+            return _metadataCollection.Value.ReplaceOneAsync(filter, metadataEntry, new ReplaceOptions { IsUpsert = true });
+        }
+
+        private JournalEntry ToJournalEntry(IPersistentRepresentation message)
+        {
+            object payload = message.Payload;
+            if (message.Payload is Tagged tagged)
+            {
+                payload = tagged.Payload;
+                message = message.WithPayload(payload); // need to update the internal payload when working with tags
+            }
+
+            // per https://github.com/akkadotnet/Akka.Persistence.MongoDB/issues/107
+            // BSON serialization
+            if (_settings.LegacySerialization)
+            {
+                var manifest = string.IsNullOrEmpty(message.Manifest) ? payload.GetType().TypeQualifiedName() : message.Manifest;
+                return new JournalEntry
+                {
+                    Id = message.PersistenceId + "_" + message.SequenceNr,
+                    Ordering = new BsonTimestamp(0), // Auto-populates with timestamp
+                    IsDeleted = message.IsDeleted,
+                    Payload = payload,
+                    PersistenceId = message.PersistenceId,
+                    SequenceNr = message.SequenceNr,
+                    Manifest = manifest,
+                    Tags = tagged.Tags?.ToList(),
+                    SerializerId = null // don't need a serializer ID here either; only for backwards-compat
+                };
+            }
+
+            // default serialization
+            var serializer = _serialization.FindSerializerFor(message);
+            var binary = serializer.ToBinary(message);
+
+            return new JournalEntry
+            {
+                Id = message.PersistenceId + "_" + message.SequenceNr,
+                Ordering = new BsonTimestamp(0), // Auto-populates with timestamp
+                IsDeleted = message.IsDeleted,
+                Payload = binary,
+                PersistenceId = message.PersistenceId,
+                SequenceNr = message.SequenceNr,
+                Manifest = string.Empty, // don't need a manifest here - it's embedded inside the PersistentMessage
+                Tags = tagged.Tags?.ToList(),
+                SerializerId = null // don't need a serializer ID here either; only for backwards-compat
+            };
+        }
+
+        private Persistent ToPersistenceRepresentation(JournalEntry entry, IActorRef sender)
+        {
+            if (_settings.LegacySerialization)
+            {
+                var manifest = string.IsNullOrEmpty(entry.Manifest) ? entry.Payload.GetType().TypeQualifiedName() : entry.Manifest;
+
+                return new Persistent(
+                    entry.Payload,
+                    entry.SequenceNr,
+                    entry.PersistenceId,
+                    manifest,
+                    entry.IsDeleted,
+                    sender);
+            }
+
+            var legacy = entry.SerializerId.HasValue || !string.IsNullOrEmpty(entry.Manifest);
+            if (!legacy)
+            {
+                var ser = _serialization.FindSerializerForType(typeof(Persistent));
+                return ser.FromBinary<Persistent>((byte[])entry.Payload);
+            }
+
+            int? serializerId = null;
+            Type type = null;
+
+            // legacy serialization
+            if (!entry.SerializerId.HasValue && !string.IsNullOrEmpty(entry.Manifest))
+                type = Type.GetType(entry.Manifest, true);
+            else
+                serializerId = entry.SerializerId;
+
+            if (entry.Payload is byte[] bytes)
+            {
+                object deserialized = null;
+                if (serializerId.HasValue)
+                {
+                    deserialized = _serialization.Deserialize(bytes, serializerId.Value, entry.Manifest);
+                }
+                else
+                {
+                    var deserializer = _serialization.FindSerializerForType(type);
+                    deserialized = deserializer.FromBinary(bytes, type);
+                }
+
+                if (deserialized is Persistent p)
+                    return p;
+
+                return new Persistent(deserialized, entry.SequenceNr, entry.PersistenceId, entry.Manifest, entry.IsDeleted, sender);
+            }
+            else // backwards compat for object serialization - Payload was already deserialized by BSON
+            {
+                return new Persistent(entry.Payload, entry.SequenceNr, entry.PersistenceId, entry.Manifest,
+                    entry.IsDeleted, sender);
+            }
+
         }
 
         /// <summary>
@@ -203,235 +410,35 @@ namespace Akka.Persistence.MongoDb.Journal
             return maxOrderingId;
         }
 
-        public override async Task<long> ReadHighestSequenceNrAsync(string persistenceId, long fromSequenceNr)
-        {
-            NotifyNewPersistenceIdAdded(persistenceId);
+        //protected override bool ReceivePluginInternal(object message)
+        //{
+        //    switch (message)
+        //    {
+        //        case ReplayTaggedMessages replay:
+        //            ReplayTaggedMessagesAsync(replay)
+        //                .PipeTo(replay.ReplyTo, success: h => new RecoverySuccess(h), failure: e => new ReplayMessagesFailure(e));
+        //            break;
+        //        case SubscribePersistenceId subscribe:
+        //            AddPersistenceIdSubscriber(Sender, subscribe.PersistenceId);
+        //            Context.Watch(Sender);
+        //            break;
+        //        case SubscribeAllPersistenceIds subscribe:
+        //            AddAllPersistenceIdSubscriber(Sender);
+        //            Context.Watch(Sender);
+        //            break;
+        //        case SubscribeTag subscribe:
+        //            AddTagSubscriber(Sender, subscribe.Tag);
+        //            Context.Watch(Sender);
+        //            break;
+        //        case Terminated terminated:
+        //            RemoveSubscriber(terminated.ActorRef);
+        //            break;
+        //        default:
+        //            return false;
+        //    }
 
-            var builder = Builders<MetadataEntry>.Filter;
-            var filter = builder.Eq(x => x.PersistenceId, persistenceId);
-
-            var highestSequenceNr = await _metadataCollection.Value.Find(filter).Project(x => x.SequenceNr).FirstOrDefaultAsync();
-
-            return highestSequenceNr;
-        }
-
-        protected override async Task<IImmutableList<Exception>> WriteMessagesAsync(IEnumerable<AtomicWrite> messages)
-        {
-            var allTags = ImmutableHashSet<string>.Empty;
-            var persistentIds = new HashSet<string>();
-            var messageList = messages.ToList();
-
-            var writeTasks = messageList.Select(async message =>
-            {
-                var persistentMessages = ((IImmutableList<IPersistentRepresentation>)message.Payload);
-
-                if (HasTagSubscribers)
-                {
-                    foreach (var p in persistentMessages)
-                    {
-                        if (p.Payload is Tagged t)
-                        {
-                            allTags = allTags.Union(t.Tags);
-                        }
-                    }
-                }
-
-                var journalEntries = persistentMessages.Select(ToJournalEntry);
-                await _journalCollection.Value.InsertManyAsync(journalEntries);
-
-                if (HasPersistenceIdSubscribers)
-                    persistentIds.Add(message.PersistenceId);
-            });
-
-            await SetHighSequenceId(messageList);
-
-            var result = await Task<IImmutableList<Exception>>
-                .Factory
-                .ContinueWhenAll(writeTasks.ToArray(),
-                    tasks => tasks.Select(t => t.IsFaulted ? TryUnwrapException(t.Exception) : null).ToImmutableList());
-
-            if (HasPersistenceIdSubscribers)
-            {
-                foreach (var id in persistentIds)
-                {
-                    NotifyPersistenceIdChange(id);
-                }
-            }
-
-            if (HasTagSubscribers && allTags.Count != 0)
-            {
-                foreach (var tag in allTags)
-                {
-                    NotifyTagChange(tag);
-                }
-            }
-
-            return result;
-        }
-
-        protected override Task DeleteMessagesToAsync(string persistenceId, long toSequenceNr)
-        {
-            NotifyNewPersistenceIdAdded(persistenceId);
-
-            var builder = Builders<JournalEntry>.Filter;
-            var filter = builder.Eq(x => x.PersistenceId, persistenceId);
-
-            if (toSequenceNr != long.MaxValue)
-                filter &= builder.Lte(x => x.SequenceNr, toSequenceNr);
-
-            return _journalCollection.Value.DeleteManyAsync(filter);
-        }
-
-        private JournalEntry ToJournalEntry(IPersistentRepresentation message)
-        {
-            object payload = message.Payload;
-            if (message.Payload is Tagged tagged)
-            {
-                payload = tagged.Payload;
-                message = message.WithPayload(payload); // need to update the internal payload when working with tags
-            }
-
-            // per https://github.com/akkadotnet/Akka.Persistence.MongoDB/issues/107
-            // BSON serialization
-            if (_settings.LegacySerialization)
-            {
-                var manifest = string.IsNullOrEmpty(message.Manifest) ? payload.GetType().TypeQualifiedName() : message.Manifest;
-                return new JournalEntry
-                {
-                    Id = message.PersistenceId + "_" + message.SequenceNr,
-                    Ordering = new BsonTimestamp(0), // Auto-populates with timestamp
-                    IsDeleted = message.IsDeleted,
-                    Payload = payload,
-                    PersistenceId = message.PersistenceId,
-                    SequenceNr = message.SequenceNr,
-                    Manifest = manifest,
-                    Tags = tagged.Tags?.ToList(),
-                    SerializerId = null // don't need a serializer ID here either; only for backwards-compat
-                };
-            }
-
-            // default serialization
-            var serializer = _serialization.FindSerializerFor(message);
-            var binary = serializer.ToBinary(message);
-
-
-            return new JournalEntry
-            {
-                Id = message.PersistenceId + "_" + message.SequenceNr,
-                Ordering = new BsonTimestamp(0), // Auto-populates with timestamp
-                IsDeleted = message.IsDeleted,
-                Payload = binary,
-                PersistenceId = message.PersistenceId,
-                SequenceNr = message.SequenceNr,
-                Manifest = string.Empty, // don't need a manifest here - it's embedded inside the PersistentMessage
-                Tags = tagged.Tags?.ToList(),
-                SerializerId = null // don't need a serializer ID here either; only for backwards-compat
-            };
-        }
-
-        private Persistent ToPersistenceRepresentation(JournalEntry entry, IActorRef sender)
-        {
-            if (_settings.LegacySerialization)
-            {
-                var manifest = string.IsNullOrEmpty(entry.Manifest) ? entry.Payload.GetType().TypeQualifiedName() : entry.Manifest;
-
-                return new Persistent(
-                    entry.Payload,
-                    entry.SequenceNr,
-                    entry.PersistenceId,
-                    manifest,
-                    entry.IsDeleted,
-                    sender);
-            }
-
-            var legacy = entry.SerializerId.HasValue || !string.IsNullOrEmpty(entry.Manifest);
-            if (!legacy)
-            {
-                var ser = _serialization.FindSerializerForType(typeof(Persistent));
-                return ser.FromBinary<Persistent>((byte[]) entry.Payload);
-            }
-
-            int? serializerId = null;
-            Type type = null;
-
-            // legacy serialization
-            if (!entry.SerializerId.HasValue && !string.IsNullOrEmpty(entry.Manifest))
-                type = Type.GetType(entry.Manifest, true);
-            else
-                serializerId = entry.SerializerId;
-
-            if (entry.Payload is byte[] bytes)
-            {
-                object deserialized = null;
-                if (serializerId.HasValue)
-                {
-                    deserialized = _serialization.Deserialize(bytes, serializerId.Value, entry.Manifest);
-                }
-                else
-                {
-                    var deserializer = _serialization.FindSerializerForType(type);
-                    deserialized = deserializer.FromBinary(bytes, type);
-                }
-
-                if (deserialized is Persistent p)
-                    return p;
-
-                return new Persistent(deserialized, entry.SequenceNr, entry.PersistenceId, entry.Manifest, entry.IsDeleted, sender);
-            }
-            else // backwards compat for object serialization - Payload was already deserialized by BSON
-            {
-                return new Persistent(entry.Payload, entry.SequenceNr, entry.PersistenceId, entry.Manifest,
-                    entry.IsDeleted, sender);
-            }
-
-        }
-
-        private async Task SetHighSequenceId(IList<AtomicWrite> messages)
-        {
-            var persistenceId = messages.Select(c => c.PersistenceId).First();
-            var highSequenceId = messages.Max(c => c.HighestSequenceNr);
-            var builder = Builders<MetadataEntry>.Filter;
-            var filter = builder.Eq(x => x.PersistenceId, persistenceId);
-
-            var metadataEntry = new MetadataEntry
-            {
-                Id = persistenceId,
-                PersistenceId = persistenceId,
-                SequenceNr = highSequenceId
-            };
-
-            await _metadataCollection.Value.ReplaceOneAsync(filter, metadataEntry, new UpdateOptions() { IsUpsert = true });
-        }
-
-        protected override bool ReceivePluginInternal(object message)
-        {
-            switch (message)
-            {
-                case ReplayTaggedMessages replay:
-                    ReplayTaggedMessagesAsync(replay)
-                        .PipeTo(replay.ReplyTo, success: h => new RecoverySuccess(h), failure: e => new ReplayMessagesFailure(e));
-                    break;
-                case SubscribePersistenceId subscribe:
-                    AddPersistenceIdSubscriber(Sender, subscribe.PersistenceId);
-                    Context.Watch(Sender);
-                    break;
-                case SubscribeAllPersistenceIds subscribe:
-                    AddAllPersistenceIdSubscriber(Sender);
-                    Context.Watch(Sender);
-                    break;
-                case SubscribeTag subscribe:
-                    AddTagSubscriber(Sender, subscribe.Tag);
-                    Context.Watch(Sender);
-                    break;
-                case Terminated terminated:
-                    RemoveSubscriber(terminated.ActorRef);
-                    break;
-                default:
-                    return false;
-            }
-
-            return true;
-        }
+        //    return true;
+        //}
 
         private void AddAllPersistenceIdSubscriber(IActorRef subscriber)
         {
@@ -527,8 +534,5 @@ namespace Akka.Persistence.MongoDb.Journal
                     subscriber.Tell(changed);
             }
         }
-
     }
-
-
 }
